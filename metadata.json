@@ -1,0 +1,6 @@
+{
+  "name": "실시간 반응속도 게임",
+  "description": "선생님(Host)과 학생(Client)들이 PeerJS P2P 통신을 통해 실시간으로 반응속도를 겨루는 5라운드 서바이벌 대결 게임입니다.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
