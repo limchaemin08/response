@@ -71,6 +71,11 @@ export default function App() {
   const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const [countdownText, setCountdownText] = useState<string | number>('');
 
+  // Game mode configurations
+  const [sessionMode, setSessionMode] = useState<'ai' | 'human'>('ai');
+  const [aiCount, setAiCount] = useState<number>(3);
+  const [aiDifficulty, setAiDifficulty] = useState<'easy' | 'medium' | 'hard' | 'impossible'>('medium');
+
   // Multi-edit: guarantee state update helper
   const isHost = role === 'host';
 
@@ -88,16 +93,16 @@ export default function App() {
     };
   }, []);
 
-  // Sync state to everyone (HOST ONLY action)
-  const broadcastState = (updatedState: GameState) => {
-    if (!networkRef.current || role !== 'host') return;
-    setGameState(updatedState);
-    networkRef.current.send({
-      type: 'SYNC_STATE',
-      senderId: 'host',
-      payload: updatedState
-    });
-  };
+  // Synthesized host-to-client automated state sync broadcaster
+  useEffect(() => {
+    if (role === 'host' && networkRef.current && gameState) {
+      networkRef.current.send({
+        type: 'SYNC_STATE',
+        senderId: 'host',
+        payload: gameState
+      });
+    }
+  }, [gameState, role]);
 
   // Sound cue hook triggered on Game State status change (Client & Host)
   useEffect(() => {
@@ -107,6 +112,85 @@ export default function App() {
       sounds.playCountdown();
     }
   }, [gameState.status]);
+
+  // Reset local interactive click states on transition to 'waiting' state for both Host and Clients
+  useEffect(() => {
+    if (gameState.status === 'waiting') {
+      setClickedThisRound(false);
+      setFoulThisRound(false);
+      setMyReactionTime(null);
+    }
+  }, [gameState.status, gameState.currentRound]);
+
+  // Keep an updated reference of players to prevent effect re-runs on state change
+  const playersRef = useRef(gameState.players);
+  useEffect(() => {
+    playersRef.current = gameState.players;
+  }, [gameState.players]);
+
+  // Hook to simulate AI Bot players click and foul actions on behalf of the host
+  useEffect(() => {
+    if (role !== 'host') return;
+    
+    const currentPlayers = playersRef.current;
+    const bots = (Object.values(currentPlayers) as Player[]).filter(p => p.isBot);
+    if (bots.length === 0) return;
+
+    const botTimeouts: NodeJS.Timeout[] = [];
+
+    if (gameState.status === 'waiting') {
+      bots.forEach(bot => {
+        // Decide if bot fouls early (early click)
+        let foulChance = 0.05;
+        if (bot.botDifficulty === 'easy') foulChance = 0.12;
+        if (bot.botDifficulty === 'hard') foulChance = 0.03;
+        if (bot.botDifficulty === 'impossible') foulChance = 0.005;
+
+        if (Math.random() < foulChance) {
+          const foulDelay = Math.random() * 2000 + 400; // foul between 400ms and 2400ms
+          const t = setTimeout(() => {
+            processPlayerFoul(bot.id);
+          }, foulDelay);
+          botTimeouts.push(t);
+        }
+      });
+    } else if (gameState.status === 'cue') {
+      bots.forEach(bot => {
+        // Skip if bot has fouled or clicked already (from the players state in the ref)
+        const botStateOnCue = currentPlayers[bot.id];
+        if (botStateOnCue?.currentRoundResult?.status === 'foul') return;
+        if (botStateOnCue?.currentRoundResult?.status === 'success') return;
+
+        // Choose response timing based on difficulty
+        let minDelay = 260;
+        let maxDelay = 400;
+
+        if (bot.botDifficulty === 'easy') {
+          minDelay = 380;
+          maxDelay = 650;
+        } else if (bot.botDifficulty === 'medium') {
+          minDelay = 260;
+          maxDelay = 380;
+        } else if (bot.botDifficulty === 'hard') {
+          minDelay = 180;
+          maxDelay = 260;
+        } else if (bot.botDifficulty === 'impossible') {
+          minDelay = 110;
+          maxDelay = 150;
+        }
+
+        const reactionTime = Math.round(Math.random() * (maxDelay - minDelay) + minDelay);
+        const t = setTimeout(() => {
+          processPlayerClick(bot.id, reactionTime);
+        }, reactionTime);
+        botTimeouts.push(t);
+      });
+    }
+
+    return () => {
+      botTimeouts.forEach(clearTimeout);
+    };
+  }, [gameState.status, gameState.currentRound, role]);
 
   // Network connection callbacks
   const handleHostStatus = (status: string, details?: string) => {
@@ -147,15 +231,14 @@ export default function App() {
 
       case 'CLIENT_DISCONNECTED':
         setNetworkStatus(`학생 퇴장: ${details}`);
-        // Remove player on disconnection if in lobby
         if (details) {
           setGameState(prev => {
             const nextPlayers = { ...prev.players };
             delete nextPlayers[details];
-            const updated = { ...prev, players: nextPlayers };
-            // Let everyone know
-            setTimeout(() => broadcastState(updated), 100);
-            return updated;
+            return {
+              ...prev,
+              players: nextPlayers
+            };
           });
         }
         break;
@@ -234,10 +317,7 @@ export default function App() {
               reactionHistory: []
             };
 
-            const nextState = { ...prev, players: updatedPlayers };
-            // Broadcast refreshed lobby players
-            setTimeout(() => broadcastState(nextState), 50);
-            return nextState;
+            return { ...prev, players: updatedPlayers };
           });
           break;
 
@@ -249,9 +329,7 @@ export default function App() {
               ...updatedPlayers[senderId],
               name: payload.name
             };
-            const nextState = { ...prev, players: updatedPlayers };
-            setTimeout(() => broadcastState(nextState), 50);
-            return nextState;
+            return { ...prev, players: updatedPlayers };
           });
           break;
 
@@ -343,9 +421,7 @@ export default function App() {
       } else {
         delete nextPlayers['host'];
       }
-      const nextState = { ...prev, players: nextPlayers };
-      setTimeout(() => broadcastState(nextState), 50);
-      return nextState;
+      return { ...prev, players: nextPlayers };
     });
   };
 
@@ -354,6 +430,128 @@ export default function App() {
     navigator.clipboard.writeText(gameState.hostPeerId);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+  };
+
+  // Start Offline AI Mode as Local Host
+  const handleStartAiMode = () => {
+    if (!userName.trim()) return;
+    
+    setRole('host');
+    setMyId('host');
+    setNetworkStatus('싱글플레이어 AI 모드');
+
+    // Generate BOTS
+    const botNamesPool = [
+      '알파고 치타', '제미나이 호랑이', '딥마인드 독수리', 
+      '텐서플로우 다람쥐', '파이토치 거북이', '알고리즘 토끼', 
+      '살쾡이봇', '매트랩 매', '클라우드 펭귄', '코파일럿 팬더'
+    ];
+    
+    // Shuffle bot names
+    const shuffledNames = [...botNamesPool].sort(() => Math.random() - 0.5);
+    
+    const initialPlayers: Record<string, Player> = {};
+    initialPlayers['host'] = {
+      id: 'host',
+      name: `${userName} (방장)`,
+      score: 0,
+      isHost: true,
+      reactionHistory: []
+    };
+
+    const diffLabels: Record<string, string> = {
+      easy: '쉬움',
+      medium: '보통',
+      hard: '어려움',
+      impossible: '신의경지'
+    };
+
+    for (let i = 0; i < aiCount; i++) {
+      const botId = `bot_${i + 1}`;
+      const botName = shuffledNames[i % shuffledNames.length];
+      initialPlayers[botId] = {
+        id: botId,
+        name: `🤖 ${botName} (${diffLabels[aiDifficulty]})`,
+        score: 0,
+        isHost: false,
+        reactionHistory: [],
+        isBot: true,
+        botDifficulty: aiDifficulty
+      };
+    }
+
+    setGameState({
+      status: 'lobby',
+      currentRound: 1,
+      players: initialPlayers,
+      hostPeerId: 'AI_LOCAL_ROOM',
+      cueTimestamp: 0,
+      roundWinnerId: null
+    });
+  };
+
+  // Add a practices AI bot to multiplayer lobby
+  const addSingleBotInLobby = () => {
+    if (role !== 'host') return;
+    
+    const botNamesPool = [
+      '알파고 치타', '제미나이 호랑이', '딥마인드 독수리', 
+      '텐서플로우 다람쥐', '파이토치 거북이', '알고리즘 토끼', 
+      '살쾡이봇', '매트랩 매', '클라우드 펭귄', '코파일럿 팬더'
+    ];
+    
+    const existingNames = (Object.values(gameState.players) as Player[]).map(p => p.name);
+    let unusedNames = botNamesPool.filter(name => !existingNames.some(en => en.includes(name)));
+    if (unusedNames.length === 0) unusedNames = botNamesPool;
+
+    const selectedName = unusedNames[Math.floor(Math.random() * unusedNames.length)];
+    const difficulties: Array<'easy' | 'medium' | 'hard' | 'impossible'> = ['easy', 'medium', 'hard', 'impossible'];
+    const randomDiff = difficulties[Math.floor(Math.random() * difficulties.length)];
+    
+    const diffLabels: Record<string, string> = {
+      easy: '쉬움',
+      medium: '보통',
+      hard: '어려움',
+      impossible: '신의경지'
+    };
+
+    const nextBotIndex = Object.keys(gameState.players).filter(id => id.startsWith('bot_')).length + 1;
+    const botId = `bot_${nextBotIndex}`;
+
+    setGameState(prev => {
+      const updatedPlayers = { ...prev.players };
+      updatedPlayers[botId] = {
+        id: botId,
+        name: `🤖 ${selectedName} (${diffLabels[randomDiff]})`,
+        score: 0,
+        isHost: false,
+        reactionHistory: [],
+        isBot: true,
+        botDifficulty: randomDiff
+      };
+
+      return {
+        ...prev,
+        players: updatedPlayers
+      };
+    });
+  };
+
+  // Clean away all 연습용 AI bots
+  const removeAllBotsInLobby = () => {
+    if (role !== 'host') return;
+    setGameState(prev => {
+      const updatedPlayers = { ...prev.players };
+      Object.keys(updatedPlayers).forEach(id => {
+        if (id.startsWith('bot_')) {
+          delete updatedPlayers[id];
+        }
+      });
+      return {
+        ...prev,
+        players: updatedPlayers
+      };
+    });
   };
 
   // RENAME request handler
@@ -367,9 +565,7 @@ export default function App() {
         if (nextPlayers['host']) {
           nextPlayers['host'].name = `${newName} (방장)`;
         }
-        const nextState = { ...prev, players: nextPlayers };
-        setTimeout(() => broadcastState(nextState), 50);
-        return nextState;
+        return { ...prev, players: nextPlayers };
       });
     } else if (role === 'client') {
       networkRef.current.send({
@@ -387,24 +583,26 @@ export default function App() {
     if (role !== 'host') return;
     if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
 
-    // Initial setup: Clear player round buffers and mark ready
-    const resetPlayers = { ...gameState.players };
-    Object.keys(resetPlayers).forEach(id => {
-      resetPlayers[id].currentRoundResult = { status: 'ready' };
+    setGameState(prev => {
+      // Clear player round buffers and mark ready with safe immutable copies
+      const resetPlayers: Record<string, Player> = {};
+      Object.keys(prev.players).forEach(id => {
+        resetPlayers[id] = {
+          ...prev.players[id],
+          currentRoundResult: { status: 'ready' }
+        };
+      });
+
+      return {
+        ...prev,
+        status: 'waiting',
+        players: resetPlayers,
+        roundWinnerId: null
+      };
     });
 
-    const waitingState: GameState = {
-      ...gameState,
-      status: 'waiting',
-      players: resetPlayers,
-      roundWinnerId: null
-    };
-    broadcastState(waitingState);
-
-    // Sounds trigger
     sounds.playCountdown();
 
-    // Random timeout triggers cue show
     const randomLatency = Math.random() * 2500 + 1500; // 1.5s to 4s random wait duration
     
     countdownIntervalRef.current = setTimeout(() => {
@@ -416,93 +614,26 @@ export default function App() {
   const triggerCueEvent = () => {
     if (role !== 'host') return;
     
-    const triggeredState: GameState = {
-      ...gameState,
-      status: 'cue',
-      cueTimestamp: Date.now()
-    };
+    const cueTime = Date.now();
     
-    // Send standard action trigger, then set state locally
     if (networkRef.current) {
       networkRef.current.send({
         type: 'CUE_TRIGGERED',
         senderId: 'host',
-        payload: { timestamp: triggeredState.cueTimestamp }
+        payload: { timestamp: cueTime }
       });
     }
     
     setLocalCueTime(performance.now());
-    setGameState(triggeredState);
+    setGameState(prev => ({
+      ...prev,
+      status: 'cue',
+      cueTimestamp: cueTime
+    }));
   };
 
-  // Host: Process Click Timing from a participant
-  const processPlayerClick = (playerId: string, reactionTime: number) => {
-    if (role !== 'host' || gameState.status !== 'cue') return;
-
-    setGameState(prev => {
-      // Safety guards
-      if (!prev.players[playerId]) return prev;
-      if (prev.players[playerId].currentRoundResult?.status === 'success') return prev; // Avoid duplicate clicks
-
-      const nextPlayers = { ...prev.players };
-      nextPlayers[playerId] = {
-        ...nextPlayers[playerId],
-        currentRoundResult: {
-          status: 'success',
-          reactionTime: reactionTime
-        }
-      };
-
-      const newState = { ...prev, players: nextPlayers };
-      
-      // Determine if round should conclude (all players clicked or fouled)
-      checkRoundCompletion(newState);
-      return newState;
-    });
-  };
-
-  // Host: Process Foul / Early Click
-  const processPlayerFoul = (playerId: string) => {
-    if (role !== 'host' || (gameState.status !== 'waiting' && gameState.status !== 'lobby')) return;
-
-    sounds.playFoul();
-
-    setGameState(prev => {
-      if (!prev.players[playerId]) return prev;
-      
-      const nextPlayers = { ...prev.players };
-      nextPlayers[playerId] = {
-        ...nextPlayers[playerId],
-        currentRoundResult: {
-          status: 'foul'
-        }
-      };
-
-      const newState = { ...prev, players: nextPlayers };
-      
-      // Check round completion if everyone has fouled (edge case)
-      checkRoundCompletion(newState);
-      return newState;
-    });
-  };
-
-  // Host: Test round completion conditions
-  const checkRoundCompletion = (currentState: GameState) => {
-    const activePlayers = Object.values(currentState.players);
-    if (activePlayers.length === 0) return;
-
-    // Check if every active player has either clicked (success) or fouled (foul)
-    const allFinished = activePlayers.every(
-      p => p.currentRoundResult && (p.currentRoundResult.status === 'success' || p.currentRoundResult.status === 'foul')
-    );
-
-    if (allFinished) {
-      evaluateRoundRanking(currentState);
-    }
-  };
-
-  // Host: Calculate results, give scores, history append
-  const evaluateRoundRanking = (currentState: GameState) => {
+  // Authoritative pure state reducer to calculate results & scoring
+  const evaluateRoundRankingState = (currentState: GameState): GameState => {
     const playersArr = Object.values(currentState.players);
     
     // Find all successful clicks
@@ -515,9 +646,9 @@ export default function App() {
 
     if (successes.length > 0) {
       winnerId = successes[0].id; // Fast clicker wins!
-      sounds.playSuccess();
+      setTimeout(() => sounds.playSuccess(), 5);
     } else {
-      sounds.playFoul(); // No successes, everyone fouled!
+      setTimeout(() => sounds.playFoul(), 5); // No successes, everyone fouled!
     }
 
     // Score distribution system
@@ -561,47 +692,155 @@ export default function App() {
       }, 500);
     }
 
-    const evaluatedState: GameState = {
+    return {
       ...currentState,
       status: nextGameStatus,
       players: nextPlayers,
       roundWinnerId: winnerId
     };
-
-    broadcastState(evaluatedState);
   };
 
-  // Host manual bypass to round results (in case somebody went AFK)
   const manualBypassRound = () => {
     if (role !== 'host') return;
-    evaluateRoundRanking(gameState);
+    setGameState(prev => evaluateRoundRankingState(prev));
   };
 
-  // Host action: Advance to subsequent round
+  // Host: Process Click Timing from a participant
+  const processPlayerClick = (playerId: string, reactionTime: number) => {
+    if (role !== 'host') return;
+
+    setGameState(prev => {
+      if (prev.status !== 'cue') return prev;
+      if (!prev.players[playerId]) return prev;
+      if (prev.players[playerId].currentRoundResult?.status === 'success') return prev; // Avoid duplicate clicks
+
+      const nextPlayers = { ...prev.players };
+      nextPlayers[playerId] = {
+        ...nextPlayers[playerId],
+        currentRoundResult: {
+          status: 'success',
+          reactionTime: reactionTime
+        }
+      };
+
+      const nextState = { ...prev, players: nextPlayers };
+      
+      // Check round completion
+      const activePlayers = Object.values(nextState.players) as Player[];
+      const allFinished = activePlayers.every(
+        p => p.currentRoundResult && (p.currentRoundResult.status === 'success' || p.currentRoundResult.status === 'foul')
+      );
+
+      if (allFinished) {
+        return evaluateRoundRankingState(nextState);
+      }
+
+      return nextState;
+    });
+  };
+
+  // Host: Process Foul / Early Click
+  const processPlayerFoul = (playerId: string) => {
+    if (role !== 'host') return;
+
+    sounds.playFoul();
+
+    setGameState(prev => {
+      if (prev.status !== 'waiting' && prev.status !== 'lobby') return prev;
+      if (!prev.players[playerId]) return prev;
+      
+      const nextPlayers = { ...prev.players };
+      nextPlayers[playerId] = {
+        ...nextPlayers[playerId],
+        currentRoundResult: {
+          status: 'foul'
+        }
+      };
+
+      const nextState = { ...prev, players: nextPlayers };
+      
+      // Check round completion if everyone has fouled
+      const activePlayers = Object.values(nextState.players) as Player[];
+      const allFinished = activePlayers.every(
+        p => p.currentRoundResult && (p.currentRoundResult.status === 'success' || p.currentRoundResult.status === 'foul')
+      );
+
+      if (allFinished) {
+        return evaluateRoundRankingState(nextState);
+      }
+
+      return nextState;
+    });
+  };
+
+  // Host action: Advance to subsequent round safely without closure state lockups
   const advanceToNextRound = () => {
     if (role !== 'host') return;
     
-    const nextRoundIndex = gameState.currentRound + 1;
+    // 1. Advance the round index and temporarily switch back to lobby
     setGameState(prev => {
-      const updated = {
-        ...prev,
-        currentRound: nextRoundIndex,
-        status: 'lobby' as const, // Transit back to lobby temporary pre-trigger state
-        roundWinnerId: null
-      };
-
-      // Reset round outputs in view
-      Object.keys(updated.players).forEach(id => {
-        updated.players[id].currentRoundResult = { status: 'none' };
+      const nextRoundIndex = prev.currentRound + 1;
+      const updatedPlayers: Record<string, Player> = {};
+      Object.keys(prev.players).forEach(id => {
+        updatedPlayers[id] = {
+          ...prev.players[id],
+          currentRoundResult: { status: 'none' }
+        };
       });
 
-      broadcastState(updated);
-      return updated;
+      return {
+        ...prev,
+        currentRound: nextRoundIndex,
+        status: 'lobby',
+        roundWinnerId: null,
+        players: updatedPlayers
+      };
     });
 
-    // Auto-trigger round countdown immediately
+    if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+    
+    // 2. Schedule immediate waiting/countdown starting from the advanced state safely
     setTimeout(() => {
-      startNextRound();
+      setGameState(prev => {
+        const resetPlayers: Record<string, Player> = {};
+        Object.keys(prev.players).forEach(id => {
+          resetPlayers[id] = {
+            ...prev.players[id],
+            currentRoundResult: { status: 'ready' }
+          };
+        });
+
+        return {
+          ...prev,
+          status: 'waiting',
+          players: resetPlayers,
+          roundWinnerId: null
+        };
+      });
+
+      sounds.playCountdown();
+
+      const randomLatency = Math.random() * 2500 + 1500;
+      countdownIntervalRef.current = setTimeout(() => {
+        const cueTimestamp = Date.now();
+        
+        if (networkRef.current) {
+          networkRef.current.send({
+            type: 'CUE_TRIGGERED',
+            senderId: 'host',
+            payload: { timestamp: cueTimestamp }
+          });
+        }
+
+        setLocalCueTime(performance.now());
+        
+        setGameState(prev => ({
+          ...prev,
+          status: 'cue',
+          cueTimestamp: cueTimestamp
+        }));
+      }, randomLatency);
+
     }, 1200);
   };
 
@@ -611,23 +850,26 @@ export default function App() {
 
     if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
 
-    const clearedPlayers = { ...gameState.players };
-    Object.keys(clearedPlayers).forEach(id => {
-      clearedPlayers[id].score = 0;
-      clearedPlayers[id].reactionHistory = [];
-      clearedPlayers[id].currentRoundResult = { status: 'none' };
+    setGameState(prev => {
+      const clearedPlayers = { ...prev.players };
+      Object.keys(clearedPlayers).forEach(id => {
+        clearedPlayers[id] = {
+          ...clearedPlayers[id],
+          score: 0,
+          reactionHistory: [],
+          currentRoundResult: { status: 'none' }
+        };
+      });
+
+      return {
+        status: 'lobby',
+        currentRound: 1,
+        players: clearedPlayers,
+        hostPeerId: prev.hostPeerId,
+        cueTimestamp: 0,
+        roundWinnerId: null
+      };
     });
-
-    const resetState: GameState = {
-      status: 'lobby',
-      currentRound: 1,
-      players: clearedPlayers,
-      hostPeerId: gameState.hostPeerId,
-      cueTimestamp: 0,
-      roundWinnerId: null
-    };
-
-    broadcastState(resetState);
   };
 
   // --- CLIENT CLICK CANVAS HANDLERS ---
@@ -742,9 +984,10 @@ export default function App() {
             <div className="bg-slate-900/80 backdrop-blur border border-slate-850 rounded-2xl p-5 shadow-xl flex flex-col gap-4">
               <h2 className="text-md font-bold text-white flex items-center gap-2 border-b border-slate-800 pb-3">
                 <Sparkles className="w-5 h-5 text-indigo-400" />
-                프로필 & 방 설정
+                프로필 & 대결 방식 설정
               </h2>
               
+              {/* Nickname Input - Used for both modes */}
               <div className="flex flex-col gap-1.5">
                 <label className="text-xs font-semibold text-slate-400">내 닉네임 입력</label>
                 <div className="flex gap-2">
@@ -754,59 +997,149 @@ export default function App() {
                     onChange={(e) => setUserName(e.target.value)}
                     maxLength={15}
                     placeholder="이름을 입력하세요"
-                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500 transition"
+                    className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-sm text-white focus:outline-none focus:border-indigo-500 transition font-medium"
                   />
                   <button 
                     onClick={() => setUserName(generateRandomNickname())}
                     title="랜덤 닉네임 생성"
-                    className="p-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl border border-slate-700 transition"
+                    className="p-2.5 bg-slate-850 hover:bg-slate-755 text-slate-200 rounded-xl border border-slate-700 transition cursor-pointer"
                   >
                     🎲
                   </button>
                 </div>
               </div>
 
-              {/* Host Session Form */}
-              <form onSubmit={handleCreateRoom} className="mt-2 border-t border-slate-800/60 pt-4 flex flex-col gap-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-400">대결 방 개설 (선생님)</span>
-                  <label className="inline-flex items-center gap-1.5 cursor-pointer text-[11px] text-indigo-400">
-                    <input
-                      type="checkbox"
-                      checked={hostParticipates}
-                      onChange={toggleHostParticipation}
-                      className="rounded border-slate-800 text-indigo-600 focus:ring-indigo-500"
-                    />
-                    선생님 직접 참여
-                  </label>
-                </div>
+              {/* Beautiful mode tabs */}
+              <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-800 mt-2">
                 <button
-                  type="submit"
-                  disabled={!userName.trim()}
-                  className="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-2.5 px-4 rounded-xl font-bold text-sm tracking-wide transition shadow-lg shadow-indigo-600/10 cursor-pointer disabled:opacity-50"
+                  type="button"
+                  onClick={() => setSessionMode('ai')}
+                  className={`flex-1 text-center py-2 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                    sessionMode === 'ai'
+                      ? 'bg-indigo-600 text-white shadow-md'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
                 >
-                  새로운 클래스 방 만들기
+                  🤖 AI 대전 모드
                 </button>
-              </form>
+                <button
+                  type="button"
+                  onClick={() => setSessionMode('human')}
+                  className={`flex-1 text-center py-2 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                    sessionMode === 'human'
+                      ? 'bg-indigo-600 text-white shadow-md'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  👥 온라인 멀티 모드
+                </button>
+              </div>
 
-              {/* Client Join Form */}
-              <form onSubmit={handleJoinRoom} className="border-t border-slate-800/60 pt-4 flex flex-col gap-2">
-                <label className="text-xs font-semibold text-slate-400">기존 방 참여 (학생)</label>
-                <input
-                  type="text"
-                  value={roomInput}
-                  onChange={(e) => setRoomInput(e.target.value.toUpperCase())}
-                  placeholder="방 코드 입력 (ID)"
-                  className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm text-white text-center font-mono focus:outline-none focus:border-indigo-500 uppercase tracking-widest"
-                />
-                <button
-                  type="submit"
-                  disabled={!userName.trim() || !roomInput.trim()}
-                  className="w-full bg-emerald-600 hover:bg-emerald-500 text-white py-2.5 px-4 rounded-xl font-bold text-sm tracking-wide transition shadow-lg shadow-emerald-600/10 cursor-pointer disabled:opacity-50 flex items-center justify-center gap-1.5"
-                >
-                  <UserPlus className="w-4 h-4" /> 방 번호로 입장하기
-                </button>
-              </form>
+              {/* Mode-specific forms */}
+              {sessionMode === 'ai' ? (
+                // AI Settings Form
+                <div className="flex flex-col gap-4 mt-2 pt-2 border-t border-slate-800/40">
+                  {/* Bot count setting */}
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-xs font-semibold text-slate-400">참가시킬 🤖 AI 수</label>
+                    <div className="grid grid-cols-4 gap-1.5">
+                      {[1, 2, 3, 5].map((cnt) => (
+                        <button
+                          key={cnt}
+                          type="button"
+                          onClick={() => setAiCount(cnt)}
+                          className={`py-1.5 text-xs font-bold rounded-lg border transition cursor-pointer ${
+                            aiCount === cnt
+                              ? 'bg-indigo-500/20 border-indigo-500 text-indigo-300'
+                              : 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
+                          }`}
+                        >
+                          {cnt}명
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Bot difficulty setting */}
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-xs font-semibold text-slate-400">AI 순발력 난이도</label>
+                    <div className="grid grid-cols-4 gap-1 border border-slate-800 p-0.5 rounded-lg bg-slate-950">
+                      {[
+                        { key: 'easy', label: '쉬움', color: 'text-emerald-400' },
+                        { key: 'medium', label: '보통', color: 'text-amber-400' },
+                        { key: 'hard', label: '어려움', color: 'text-rose-400' },
+                        { key: 'impossible', label: '신', color: 'text-violet-400 font-extrabold animate-pulse' }
+                      ].map((diff) => (
+                        <button
+                          key={diff.key}
+                          type="button"
+                          onClick={() => setAiDifficulty(diff.key as any)}
+                          className={`py-1.5 text-xs font-semibold rounded transition cursor-pointer ${
+                            aiDifficulty === diff.key
+                              ? 'bg-slate-800 text-white'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          <span className={diff.color}>{diff.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={handleStartAiMode}
+                    disabled={!userName.trim()}
+                    className="w-full mt-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white py-3 px-4 rounded-xl font-bold text-sm tracking-wide transition shadow-lg shadow-indigo-600/10 cursor-pointer disabled:opacity-50 flex items-center justify-center gap-1.5"
+                  >
+                    <Zap className="w-4 h-4 fill-white" /> AI 대항전 대기실 입장
+                  </button>
+                </div>
+              ) : (
+                // Human WebRTC Session Form
+                <div className="flex flex-col gap-3 mt-2">
+                  {/* Host Session Form */}
+                  <form onSubmit={handleCreateRoom} className="flex flex-col gap-3 pt-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-slate-400">대결 방 개설 (방장)</span>
+                      <label className="inline-flex items-center gap-1.5 cursor-pointer text-[11px] text-indigo-400">
+                        <input
+                          type="checkbox"
+                          checked={hostParticipates}
+                          onChange={toggleHostParticipation}
+                          className="rounded border-slate-800 text-indigo-600 focus:ring-indigo-500"
+                        />
+                        방장 직접 참여
+                      </label>
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={!userName.trim()}
+                      className="w-full bg-indigo-600 hover:bg-indigo-500 text-white py-2.5 px-4 rounded-xl font-bold text-sm tracking-wide transition shadow-lg shadow-indigo-600/10 cursor-pointer disabled:opacity-50"
+                    >
+                      새로운 멀티플레이 방 만들기
+                    </button>
+                  </form>
+
+                  {/* Client Join Form */}
+                  <form onSubmit={handleJoinRoom} className="border-t border-slate-800/60 pt-4 flex flex-col gap-2">
+                    <label className="text-xs font-semibold text-slate-400">기존 방 참여 (참가자)</label>
+                    <input
+                      type="text"
+                      value={roomInput}
+                      onChange={(e) => setRoomInput(e.target.value.toUpperCase())}
+                      placeholder="방 코드 입력 (ID)"
+                      className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-2.5 text-sm text-white text-center font-mono focus:outline-none focus:border-indigo-500 uppercase tracking-widest"
+                    />
+                    <button
+                      type="submit"
+                      disabled={!userName.trim() || !roomInput.trim()}
+                      className="w-full bg-emerald-600 hover:bg-emerald-500 text-white py-2.5 px-4 rounded-xl font-bold text-sm tracking-wide transition shadow-lg shadow-emerald-600/10 cursor-pointer disabled:opacity-50 flex items-center justify-center gap-1.5"
+                    >
+                      <UserPlus className="w-4 h-4" /> 방 번호로 입장하기
+                    </button>
+                  </form>
+                </div>
+              )}
 
               {errorLog && (
                 <div className="mt-2 p-3 bg-rose-500/10 border border-rose-500/20 text-rose-400 text-xs rounded-xl flex items-start gap-2 animate-bounce">
@@ -847,14 +1180,34 @@ export default function App() {
                   </div>
 
                   {gameState.status === 'lobby' && (
-                    <button
-                      onClick={startNextRound}
-                      disabled={activePlayersList.length < 1}
-                      className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold p-3 rounded-xl shadow-lg transition flex items-center justify-center gap-2 cursor-pointer"
-                    >
-                      <Play className="w-5 h-5 fill-current" />
-                      {gameState.currentRound === 1 ? '반응속도 대결 시작' : '다음 라운드 시작'}
-                    </button>
+                    <div className="flex flex-col gap-2.5">
+                      <button
+                        onClick={startNextRound}
+                        disabled={activePlayersList.length < 1}
+                        className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold p-3 rounded-xl shadow-lg transition flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        <Play className="w-5 h-5 fill-current" />
+                        {gameState.currentRound === 1 ? '반응속도 대결 시작' : '다음 라운드 시작'}
+                      </button>
+
+                      {/* Add/remove practice AI bots in lobby */}
+                      <div className="pt-2 border-t border-slate-800/80 grid grid-cols-2 gap-2">
+                        <button
+                          type="button"
+                          onClick={addSingleBotInLobby}
+                          className="py-2 px-3 bg-slate-850 hover:bg-slate-800 text-slate-200 text-xs font-semibold rounded-lg border border-slate-700 transition flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          🤖 연습용 AI 추가
+                        </button>
+                        <button
+                          type="button"
+                          onClick={removeAllBotsInLobby}
+                          className="py-2 px-3 bg-slate-900 hover:bg-rose-950/40 hover:border-rose-900/60 text-slate-400 hover:text-rose-400 text-xs font-semibold rounded-lg border border-slate-800 transition flex items-center justify-center gap-1.5 cursor-pointer"
+                        >
+                          ❌ 모든 AI 제거
+                        </button>
+                      </div>
+                    </div>
                   )}
 
                   {gameState.status === 'waiting' && (

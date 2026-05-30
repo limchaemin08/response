@@ -8,6 +8,8 @@ export interface Player {
   name: string;
   score: number;
   isHost: boolean;
+  isBot?: boolean;
+  botDifficulty?: 'easy' | 'medium' | 'hard' | 'impossible';
   reactionHistory: number[]; // Reaction times for each completed round (in ms, or -1 for fouls/misses)
   currentRoundResult?: {
     status: 'none' | 'success' | 'foul' | 'ready';
